@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node --check backend/routes/orders.js)",
+      "Bash(node -e ' *)",
+      "Bash(node --check frontend/checkout.js)"
+    ]
+  }
+}

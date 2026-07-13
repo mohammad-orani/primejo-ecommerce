@@ -215,7 +215,10 @@ async function updateDeliveryFee() {
     const products = await getProducts();
     const cartTotal = cart.reduce((total, item) => {
         const product = products.find(p => String(p.id) === String(item.productId));
-        return product ? total + (parseFloat(product.new_price || product.newPrice || 0) * item.quantity) : total;
+        if (!product) return total;
+        const isTier = item.tierPrice !== undefined && item.tierPrice !== null;
+        const itemTotal = isTier ? item.tierPrice : parseFloat(product.new_price || product.newPrice || 0) * item.quantity;
+        return total + itemTotal;
     }, 0);
 
     // Free if any cart item has the free-delivery flag
@@ -446,13 +449,21 @@ document.getElementById('checkoutForm')?.addEventListener('submit', async functi
             clearCart();
             closeFreeDeliveryPopup();
 
+            // Prefer the authoritative values the backend actually persisted —
+            // falls back to the pre-submission estimate only if the server
+            // response doesn't include them (e.g. an older deployed backend).
+            const finalItems    = result.items    || orderItems;
+            const finalSubtotal = result.subtotal ?? subtotal;
+            const finalDelivery = result.delivery_fee ?? selectedDeliveryFee;
+            const finalTotal    = result.total    ?? (finalSubtotal + finalDelivery);
+
             if (window.fbq) {
                 fbq('track', 'Purchase', {
-                    value:        subtotal + selectedDeliveryFee,
+                    value:        finalTotal,
                     currency:     (typeof currentCurrency !== 'undefined') ? currentCurrency : 'JOD',
-                    content_ids:  orderItems.map(i => String(i.productId)),
+                    content_ids:  finalItems.map(i => String(i.productId)),
                     content_type: 'product',
-                    num_items:    orderItems.reduce((s, i) => s + i.quantity, 0)
+                    num_items:    finalItems.reduce((s, i) => s + i.quantity, 0)
                 });
             }
 
@@ -460,7 +471,7 @@ document.getElementById('checkoutForm')?.addEventListener('submit', async functi
 
             const modalItemsEl = document.getElementById('modalOrderItems');
             if (modalItemsEl) {
-                modalItemsEl.innerHTML = orderItems.map(item => `
+                modalItemsEl.innerHTML = finalItems.map(item => `
                     <div class="modal-item-row">
                         <span class="modal-item-name">${isAr && item.productNameAr ? item.productNameAr : item.productName}</span>
                         <span class="modal-item-qty">×${item.quantity}</span>
@@ -470,18 +481,18 @@ document.getElementById('checkoutForm')?.addEventListener('submit', async functi
             }
 
             const modalSubtotalEl = document.getElementById('modalSubtotal');
-            if (modalSubtotalEl) modalSubtotalEl.textContent = formatPrice(subtotal);
+            if (modalSubtotalEl) modalSubtotalEl.textContent = formatPrice(finalSubtotal);
 
             const modalDeliveryEl = document.getElementById('modalDelivery');
             if (modalDeliveryEl) {
-                modalDeliveryEl.textContent = selectedDeliveryFee === 0
+                modalDeliveryEl.textContent = finalDelivery === 0
                     ? (isAr ? 'مجاناً ✓' : 'FREE ✓')
-                    : formatPrice(selectedDeliveryFee);
-                if (selectedDeliveryFee === 0) modalDeliveryEl.style.color = '#10b981';
+                    : formatPrice(finalDelivery);
+                if (finalDelivery === 0) modalDeliveryEl.style.color = '#10b981';
             }
 
             const modalTotalEl = document.getElementById('modalTotal');
-            if (modalTotalEl) modalTotalEl.textContent = formatPrice(subtotal + selectedDeliveryFee);
+            if (modalTotalEl) modalTotalEl.textContent = formatPrice(finalTotal);
 
             const modalCustomerEl = document.getElementById('modalCustomerName');
             if (modalCustomerEl) modalCustomerEl.textContent = document.getElementById('customerName')?.value || '';

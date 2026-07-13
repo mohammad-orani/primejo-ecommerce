@@ -8,6 +8,70 @@ const { sendOrderConfirmation, notifyAdmin } = require('../utils/whatsapp');
 
 const router = express.Router();
 
+// Resolve the authoritative selling price for one order line from the product's
+// own bundle tiers — the backend is the single source of truth for price, never
+// the client.
+//
+// The cart merges repeated/mixed "add to cart" actions for the same product into
+// a single {quantity, tierPrice} line (see frontend/api.js addToCart), so by the
+// time an order arrives, quantity alone no longer tells us whether it came from
+// one tier, several of the same tier, or a mix of different tiers. Matching only
+// an *exact* single tier for the submitted quantity (the earlier approach) loses
+// that pricing the moment two bundle purchases get merged — e.g. two 3-pc/7 JOD
+// bundles merge into quantity=6, which has no tier of its own and would wrongly
+// fall back to 6 × base price.
+//
+// Instead, treat the base price (as a 1-unit "tier") and every defined bundle
+// tier as reusable building blocks, and find the cheapest way to make up the
+// exact submitted quantity from any combination of them (unbounded knapsack /
+// coin-change). This reconstructs the true total regardless of how the cart
+// happened to merge the customer's bundle selections, is a pure function of the
+// product's own tier data (never trusts client-submitted price/total), and can
+// never exceed plain quantity × base price since that combination is always one
+// of the candidates considered.
+function resolveItemPricing(product, quantity) {
+    const qty = parseInt(quantity, 10) || 1;
+    const basePrice = parseFloat(product?.new_price) || 0;
+    if (qty <= 0) return { price: 0, total: 0 };
+
+    let tiers = product?.quantity_tiers;
+    if (typeof tiers === 'string') {
+        try { tiers = JSON.parse(tiers); } catch { tiers = null; }
+    }
+
+    const units = [{ qty: 1, price: basePrice }];
+    if (Array.isArray(tiers)) {
+        tiers.forEach(t => {
+            const tQty = parseInt(t.qty, 10);
+            const tPrice = parseFloat(t.price);
+            if (tQty > 0 && tPrice >= 0) units.push({ qty: tQty, price: tPrice });
+        });
+    }
+
+    // Sanity bound — quantities beyond this aren't realistic bundle purchases;
+    // skip the DP and just charge flat rate rather than doing needless work.
+    const DP_CAP = 2000;
+    if (qty > DP_CAP) {
+        return { price: basePrice, total: parseFloat((basePrice * qty).toFixed(2)) };
+    }
+
+    const bestCost = new Array(qty + 1).fill(Infinity);
+    bestCost[0] = 0;
+    for (let n = 1; n <= qty; n++) {
+        for (const u of units) {
+            if (u.qty <= n && bestCost[n - u.qty] + u.price < bestCost[n]) {
+                bestCost[n] = bestCost[n - u.qty] + u.price;
+            }
+        }
+    }
+
+    const total = Number.isFinite(bestCost[qty]) ? bestCost[qty] : basePrice * qty;
+    return {
+        price: parseFloat((total / qty).toFixed(2)),
+        total: parseFloat(total.toFixed(2))
+    };
+}
+
 // Helper: fetch items for one order by its numeric DB id
 async function fetchOrderItems(dbId) {
     const [rows] = await pool.query(
@@ -56,7 +120,7 @@ router.post('/', async (req, res) => {
             delivery_address, order_notes,
             payment_method,
             delivery_fee, actual_delivery_fee, shipping_fee,
-            items, subtotal, total, currency, language, order_status
+            items, currency, language, order_status
         } = req.body;
 
         const order_id = clientOrderId || ('ORD-' + Date.now());
@@ -78,6 +142,36 @@ router.post('/', async (req, res) => {
             }
         }
 
+        // Look up the real product records so pricing can be derived server-side
+        // instead of trusting whatever price/total the client happened to send.
+        const productIds = [...new Set((items || [])
+            .map(item => parseInt(item.productId, 10))
+            .filter(id => Number.isInteger(id)))];
+
+        const productsById = new Map();
+        if (productIds.length > 0) {
+            const [productRows] = await connection.query(
+                `SELECT id, new_price, quantity_tiers FROM products WHERE id IN (${productIds.map(() => '?').join(',')})`,
+                productIds
+            );
+            productRows.forEach(p => productsById.set(p.id, p));
+        }
+
+        let serverSubtotal = 0;
+        const resolvedItems = (items || []).map(item => {
+            const productId = parseInt(item.productId, 10);
+            const product = productsById.get(productId);
+            // Product no longer exists (e.g. deleted) — fall back to the client value
+            // rather than dropping the item, since we have no authoritative price to derive.
+            const pricing = product
+                ? resolveItemPricing(product, item.quantity)
+                : { price: parseFloat(item.price) || 0, total: parseFloat(item.total) || 0 };
+            serverSubtotal += pricing.total;
+            return { ...item, productId, price: pricing.price, total: pricing.total };
+        });
+        serverSubtotal = parseFloat(serverSubtotal.toFixed(2));
+        const serverTotal = parseFloat((serverSubtotal + displayedFee).toFixed(2));
+
         const [orderResult] = await connection.query(
             `INSERT INTO orders (
                 order_id,
@@ -96,24 +190,24 @@ router.post('/', async (req, res) => {
                 delivery_street || '', delivery_building || '', delivery_floor || '',
                 delivery_address || '', order_notes || '',
                 payment_method || 'cash', 'pending', order_status || 'pending',
-                currency || 'JOD', subtotal || 0, displayedFee, actualFee,
-                total || 0, language || 'en'
+                currency || 'JOD', serverSubtotal, displayedFee, actualFee,
+                serverTotal, language || 'en'
             ]
         );
 
         const dbOrderId = orderResult.insertId;
 
-        for (const item of (items || [])) {
+        for (const item of resolvedItems) {
             await connection.query(
                 `INSERT INTO order_items (order_id, product_id, product_name_en, product_name_ar, quantity, price, total, selected_variant)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-                [dbOrderId, parseInt(item.productId), item.productName || '',
+                [dbOrderId, item.productId, item.productName || '',
                     item.productNameAr || '', item.quantity, item.price, item.total,
                     item.selectedColor || null]
             );
         }
 
-        for (const item of (items || [])) {
+        for (const item of resolvedItems) {
             if (item.productId) {
                 await connection.query(
                     `UPDATE products
@@ -129,16 +223,16 @@ router.post('/', async (req, res) => {
         console.log(`Order created: ${order_id} | db id: ${dbOrderId} | ${(items || []).length} items`);
         const phoneChanged = customer_phone !== sanitizedPhone;
         await logAction(req, 'CREATE', 'order', order_id,
-            `New order from ${customer_name || 'unknown'} | phone_raw: ${customer_phone || '—'}${phoneChanged ? ` → phone_saved: ${sanitizedPhone}` : ''} | city: ${delivery_city || '—'} | total: ${total || 0} | items: ${(items || []).length}`
+            `New order from ${customer_name || 'unknown'} | phone_raw: ${customer_phone || '—'}${phoneChanged ? ` → phone_saved: ${sanitizedPhone}` : ''} | city: ${delivery_city || '—'} | total: ${serverTotal} | items: ${(items || []).length}`
         );
 
         // WhatsApp notifications (fire-and-forget — never block the response)
         const waPhone = sanitizedPhone || customer_phone || '';
         if (waPhone) {
-            sendOrderConfirmation(waPhone, customer_name || 'عزيزي العميل', order_id, total || 0)
+            sendOrderConfirmation(waPhone, customer_name || 'عزيزي العميل', order_id, serverTotal)
                 .catch(e => console.warn('WA confirmation failed:', e.message));
         }
-        notifyAdmin(order_id, customer_name || 'Unknown', total || 0, waPhone)
+        notifyAdmin(order_id, customer_name || 'Unknown', serverTotal, waPhone)
             .catch(e => console.warn('WA admin notify failed:', e.message));
 
         // Auto-save customer phone to whatsapp_contacts
@@ -170,7 +264,26 @@ router.post('/', async (req, res) => {
             console.warn('WA contact auto-save warning:', waErr.message);
         }
 
-        res.status(201).json({ success: true, message: 'Order created successfully', order_id });
+        res.status(201).json({
+            success: true,
+            message: 'Order created successfully',
+            order_id,
+            // Authoritative values actually persisted — lets the frontend show
+            // the confirmation using the same numbers that were stored, instead
+            // of re-displaying its own pre-submission estimate.
+            subtotal: serverSubtotal,
+            delivery_fee: displayedFee,
+            total: serverTotal,
+            items: resolvedItems.map(item => ({
+                productId:     item.productId,
+                productName:   item.productName || '',
+                productNameAr: item.productNameAr || '',
+                quantity:      item.quantity,
+                price:         item.price,
+                total:         item.total,
+                selectedColor: item.selectedColor || null
+            }))
+        });
 
     } catch (error) {
         await connection.rollback();
